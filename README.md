@@ -1,1 +1,0 @@
-# Autobounty.lua
