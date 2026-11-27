@@ -96,12 +96,13 @@ local Tabs = {
     Attacks = Window:Tab({ Title = T("Combat Settings") }),
     ESP = Window:Tab({ Title = "ESP" }),
     Server = Window:Tab({ Title = T("Server") }),
+    Webhook = Window:Tab({ Title = "Webhook" }),
     Settings = Window:Tab({ Title = T("Settings") })
 }
 
 local AutoSaveStatus = { Tabs = 0, Wrapped = 0, Buttons = 0, Failed = {} }
 
-local WIDGET_METHODS = { "Toggle", "Slider", "Dropdown", "Button" }
+local WIDGET_METHODS = { "Toggle", "Slider", "Dropdown", "Button", "Input" }
 
 local function WrapTabForAutoSave(tab)
     local wrapped = 0
@@ -203,6 +204,12 @@ local Settings = {
     AutoSaveConfig = true,
     SelectTeam = "Pirates",
     MaxStaySeconds = 360,
+    NoTargetHopDelay = 3,
+    WebhookEnabled = true,
+    WebhookUrl = "https://discord.com/api/webhooks/1575975912338362579/G9Q9AbFhqrkn_jR7KcdYyw4VNee3LOm9yWYZ-XlStJNRxCLusUn4RD8T2DsxWMgOln3g",
+    WebhookOnKill = true,
+    WebhookOnHop = true,
+    WebhookHideName = false,
     ConfigVersion = 2
 }
 
@@ -247,6 +254,7 @@ local function ApplyConfigTable(data)
     clampNum("MaxStaySeconds", 60, 3600)
     clampNum("AutoFleeHP", 1, 100)
     clampNum("ESP_FontSize", 8, 28)
+    clampNum("NoTargetHopDelay", 1, 30)
     if type(data.V4Only) == "table" then
         for tip in pairs(Settings.V4Only) do
             if type(data.V4Only[tip]) == "boolean" then Settings.V4Only[tip] = data.V4Only[tip] end
@@ -317,6 +325,7 @@ local FleeActive = false
 local SoruLastTime = 0
 
 local NextTargetSwitch = 0
+local NoTargetSince = nil
 local TargetLostTime = 0
 local LastScanTime = 0
 
@@ -1696,6 +1705,169 @@ end
 
 SetupHUD()
 
+-- ═══════════════════════════════════════════════════════════════
+-- Discord webhook (bounty earned / server hop / test)
+-- ═══════════════════════════════════════════════════════════════
+local Webhook = {}
+do
+    local HttpService = game:GetService("HttpService")
+    local httpRequest = (syn and syn.request) or (http and http.request) or http_request or request
+    local ALLOWED_HOSTS = {
+        ["discord.com"] = true, ["ptb.discord.com"] = true,
+        ["canary.discord.com"] = true, ["discordapp.com"] = true
+    }
+    local queue, pumping = {}, false
+    local session = { Earned = 0, Kills = 0, LastTarget = nil }
+
+    function Webhook.UrlOk(url)
+        if type(url) ~= "string" then return false end
+        local host = url:match("^https://([^/]+)/api/webhooks/%d+/[%w_%-]+$")
+        return host ~= nil and ALLOWED_HOSTS[host] == true
+    end
+
+    local function Post(payload)
+        if type(httpRequest) ~= "function" then return false, "executor has no http request" end
+        local url = Settings.WebhookUrl
+        if not Webhook.UrlOk(url) then return false, "invalid webhook url" end
+        local okEnc, body = pcall(HttpService.JSONEncode, HttpService, payload)
+        if not okEnc then return false, "json error" end
+        local ok, res = pcall(httpRequest, {
+            Url = url,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = body
+        })
+        if not ok or type(res) ~= "table" then return false, "request failed" end
+        local code = tonumber(res.StatusCode) or 0
+        if code == 429 then
+            local wait = 2
+            pcall(function() wait = tonumber(HttpService:JSONDecode(res.Body).retry_after) or 2 end)
+            return false, "rate", math.clamp(wait, 1, 30)
+        end
+        if code >= 200 and code < 300 then return true, tostring(code) end
+        return false, "http " .. tostring(code)
+    end
+
+    local function Pump()
+        if pumping then return end
+        pumping = true
+        task.spawn(function()
+            while #queue > 0 do
+                local item = table.remove(queue, 1)
+                local ok, info, retry = Post(item.Payload)
+                if not ok and info == "rate" and item.Tries < 3 then
+                    item.Tries += 1
+                    table.insert(queue, 1, item)
+                    task.wait(retry or 2)
+                else
+                    task.wait(1.2)
+                end
+            end
+            pumping = false
+        end)
+    end
+
+    local function Enqueue(payload)
+        if #queue >= 20 then table.remove(queue, 1) end
+        queue[#queue + 1] = { Payload = payload, Tries = 0 }
+        Pump()
+    end
+
+    local function Field(name, value, inline)
+        return { name = name, value = tostring(value ~= nil and value ~= "" and value or "-"), inline = inline ~= false }
+    end
+
+    local function Build(title, color, fields)
+        local who = Settings.WebhookHideName and "hidden" or LocalPlayer.Name
+        return {
+            username = "Frozy Hub",
+            embeds = {{
+                title = title,
+                color = color,
+                fields = fields,
+                footer = { text = "Frozy Hub | " .. who },
+                timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+            }}
+        }
+    end
+
+    local function RunTimeText()
+        local ok, seconds = pcall(HUD.GetRunTime)
+        seconds = ok and math.floor(tonumber(seconds) or 0) or 0
+        return string.format("%02d:%02d:%02d", seconds // 3600, seconds % 3600 // 60, seconds % 60)
+    end
+
+    function Webhook.Notify(kind, data)
+        if not Settings.WebhookEnabled or not Webhook.UrlOk(Settings.WebhookUrl) then return end
+        data = data or {}
+        if kind == "kill" then
+            if not Settings.WebhookOnKill then return end
+            Enqueue(Build("Bounty earned", 3066993, {
+                Field("Earned", "+" .. FormatNumber(data.Earned or 0)),
+                Field("Current Bounty", FormatNumber(data.Current or 0)),
+                Field("Target", data.Target or "unknown"),
+                Field("Session Earned", FormatNumber(session.Earned)),
+                Field("Kills", session.Kills),
+                Field("Runtime", RunTimeText())
+            }))
+        elseif kind == "hop" then
+            if not Settings.WebhookOnHop then return end
+            Enqueue(Build("Server hop", 3447003, {
+                Field("Region", data.Region or "?"),
+                Field("Players", data.Count or "?"),
+                Field("Server Bounty", FormatNumber(data.Bounty or 0)),
+                Field("Session Earned", FormatNumber(session.Earned)),
+                Field("Runtime", RunTimeText())
+            }))
+        end
+    end
+
+    local function Toast(text)
+        pcall(function()
+            WindUI:Notify({ Title = "Webhook", Content = text, Duration = 4 })
+        end)
+    end
+
+    function Webhook.Test()
+        task.spawn(function()
+            if not Webhook.UrlOk(Settings.WebhookUrl) then
+                Toast("Invalid URL. It must look like https://discord.com/api/webhooks/ID/TOKEN")
+                return
+            end
+            local ok, info = Post(Build("Webhook test", 10181046, {
+                Field("Status", "Frozy Hub is connected"),
+                Field("Runtime", RunTimeText())
+            }))
+            Toast(ok and "Test message sent" or ("Failed: " .. tostring(info)))
+        end)
+    end
+
+    local function ReadBounty()
+        local stats = LocalPlayer:FindFirstChild("leaderstats")
+        local value = stats and stats:FindFirstChild("Bounty/Honor")
+        return value and tonumber(value.Value) or nil
+    end
+
+    task.spawn(function()
+        local last = nil
+        while true do
+            task.wait(1)
+            pcall(function()
+                if CurrentTarget then session.LastTarget = CurrentTarget.Name end
+                local current = ReadBounty()
+                if not current then return end
+                if last and current > last then
+                    local earned = current - last
+                    session.Earned += earned
+                    session.Kills += 1
+                    Webhook.Notify("kill", { Earned = earned, Current = current, Target = session.LastTarget })
+                end
+                last = current
+            end)
+        end
+    end)
+end
+
 local ServerHopCache = { List = nil, Fetching = false }
 
 local function InvokeTimeout(remote, timeout, ...)
@@ -1715,40 +1887,56 @@ local function InvokeTimeout(remote, timeout, ...)
     return ok, result, false
 end
 
+local HopPredicates = {}
+
 local function FetchServerList(timeout)
     local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
     if not browser then return nil end
     local servers = {}
-    local deadline = tick() + (timeout or 20)
-    local MAX_PAGES = 40
-    local emptyStreak = 0
-    for page = 1, MAX_PAGES do
-        if tick() >= deadline then break end
-        local ok, result = InvokeTimeout(browser, 6, page)
-        if not ok then
-            task.wait(0.5)
-            ok, result = InvokeTimeout(browser, 6, page)
+    local deadline = tick() + (timeout or 25)
+    local MAX_PAGES, BATCH = 60, 4
+    local nextPage, emptyBatches, goodCount = 1, 0, 0
+    while nextPage <= MAX_PAGES and tick() < deadline do
+        local pending, results = BATCH, {}
+        for i = 0, BATCH - 1 do
+            local page = nextPage + i
+            task.spawn(function()
+                local ok, result = InvokeTimeout(browser, 6, page)
+                results[i + 1] = (ok and type(result) == "table") and result or false
+                pending -= 1
+            end)
+        end
+        nextPage += BATCH
+        local began = tick()
+        while pending > 0 and tick() - began < 8 do
+            task.wait(0.05)
         end
         local added = 0
-        if ok and type(result) == "table" then
-            for job, info in pairs(result) do
-                if type(info) == "table" and type(job) == "string" then
-                    servers[job] = {
-                        Region = tostring(info.Region or "Unknown"),
-                        Count = tonumber(info.Count) or 0,
-                        Bounty = tonumber(info.Bounty) or 0
-                    }
-                    added += 1
+        for i = 1, BATCH do
+            local result = results[i]
+            if result then
+                for job, info in pairs(result) do
+                    if type(info) == "table" and type(job) == "string" then
+                        local entry = {
+                            Region = tostring(info.Region or "Unknown"),
+                            Count = tonumber(info.Count) or 0,
+                            Bounty = tonumber(info.Bounty) or 0
+                        }
+                        servers[job] = entry
+                        added += 1
+                        if HopPredicates.Strict and HopPredicates.Strict(entry) then goodCount += 1 end
+                    end
                 end
             end
         end
         if added == 0 then
-            emptyStreak += 1
-            if emptyStreak >= 3 then break end
+            emptyBatches += 1
+            if emptyBatches >= 2 then break end
         else
-            emptyStreak = 0
+            emptyBatches = 0
         end
-        task.wait(0.15)
+        if goodCount >= 6 then break end
+        task.wait(0.2)
     end
     return servers
 end
@@ -1756,12 +1944,12 @@ end
 local function GetServerList()
     if ServerHopCache.List then return ServerHopCache.List end
     if ServerHopCache.Fetching then
-        local deadline = tick() + 25
+        local deadline = tick() + 35
         while ServerHopCache.Fetching and tick() < deadline do task.wait(0.1) end
         return ServerHopCache.List
     end
     ServerHopCache.Fetching = true
-    local ok, servers = pcall(FetchServerList, 20)
+    local ok, servers = pcall(FetchServerList, 25)
     ServerHopCache.Fetching = false
     if ok and type(servers) == "table" and next(servers) then
         ServerHopCache.List = servers
@@ -1784,6 +1972,8 @@ local function MatchServer(info)
     local bounty = tonumber(info.Bounty) or 0
     return bounty >= HopMinBounty and bounty <= HopMaxBounty
 end
+
+HopPredicates.Strict = MatchServer
 
 local function MatchServerRelaxed(info)
     return MatchRegion(info)
@@ -1814,6 +2004,23 @@ end
 
 local HopPhase = "idle"
 local HopPrepStartY = nil
+local HopPrepSince = 0
+local HopFailStreak = 0
+local ManualHop = { Active = false, Override = false }
+
+local HopToastLast = {}
+local function HopToast(text)
+    local now = tick()
+    if HopToastLast[text] and now - HopToastLast[text] < 6 then return end
+    HopToastLast[text] = now
+    pcall(function()
+        WindUI:Notify({ Title = "Server Hop", Content = text, Duration = 4 })
+    end)
+end
+
+local function RiskBlocksHop()
+    return IsBountyAtRisk() and not ManualHop.Override
+end
 
 function HopActive()
     return HopPhase ~= "idle"
@@ -1855,6 +2062,10 @@ local HopWaitUntil = 0
 
 local HopToken = 0
 
+local function ManualHopOn()
+    return ManualHop.Active and HopActive()
+end
+
 local function BeginHopMatch()
     HopPhase = "matching"
     HopToken += 1
@@ -1863,7 +2074,14 @@ local function BeginHopMatch()
         local function stale()
             return token ~= HopToken or not HopActive()
         end
+        local function giveUp(cooldown)
+            ManualHop.Active = false
+            ManualHop.Override = false
+            HopPhase = "idle"
+            HopCooldownUntil = tick() + (cooldown or HOP_LANDING_GRACE)
+        end
 
+        HopToast("Scanning servers...")
         local servers = GetServerList()
         local target = PickServer(servers)
         if not target then
@@ -1871,31 +2089,42 @@ local function BeginHopMatch()
             servers = GetServerList()
             target = PickServer(servers)
         end
+        if not target and (ManualHop.Active or HopFailStreak >= 2) then
+            local any = CollectMatches(servers, function() return true end)
+            if #any > 0 then
+                target = any[math.random(1, #any)]
+                HopToast("No server in region " .. tostring(Settings.ServerRegion) .. ", using any server")
+            end
+        end
 
         if stale() then return end
 
         if not target then
+            HopFailStreak += 1
+            HopToast("No server found (region " .. tostring(Settings.ServerRegion) .. "). Try region Random.")
             task.wait(3)
             if stale() then return end
-            HopPhase = "idle"
-            HopCooldownUntil = tick() + HOP_LANDING_GRACE
+            giveUp(HOP_LANDING_GRACE)
             return
         end
 
-        if IsBountyAtRisk() then
+        if RiskBlocksHop() then
             HopPhase = "preparing"
+            HopPrepSince = tick()
             HopInterruptedByDanger = true
             return
         end
 
-        if CurrentTarget and not Stay.Armed then
+        if CurrentTarget and not Stay.Armed and not ManualHop.Active then
             -- a target appeared: cancel the hop instead of staying stuck in "matching"
-            HopPhase = "idle"
-            HopCooldownUntil = tick() + 3
+            giveUp(3)
             return
         end
 
+        HopFailStreak = 0
+        HopToast(string.format("Teleporting: %s, %s players", tostring(target.Region), tostring(target.Count)))
         HUD.QueueAutoReExecute()
+        pcall(Webhook.Notify, "hop", target)
         local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
         local sent, timedOut = false, false
         if browser then
@@ -1910,8 +2139,7 @@ local function BeginHopMatch()
         task.wait(12)
         if token ~= HopToken then return end
         ServerHopCache.List = nil
-        HopCooldownUntil = tick() + 10
-        HopPhase = "idle"
+        giveUp(10)
     end)
 end
 
@@ -1919,48 +2147,88 @@ pcall(function()
     game:GetService("TeleportService").TeleportInitFailed:Connect(function()
         ServerHopCache.List = nil
         HopCooldownUntil = tick() + 8
-        if HopPhase == "matching" then HopPhase = "idle" end
+        if HopPhase == "matching" then
+            ManualHop.Active = false
+            ManualHop.Override = false
+            HopPhase = "idle"
+            HopToast("Teleport failed, trying again later")
+        end
     end)
 end)
 
-local function DoServerHop()
+local HopActiveSince = nil
+
+local function DoServerHop(manual)
     if HopActive() then return end
 
     HopPhase = "preparing"
     HopPrepStartY = nil
+    HopPrepSince = tick()
     ResetTarget()
-    StartHopAscend()
 
-    if IsBountyAtRisk() then
+    if RiskBlocksHop() then
         HopInterruptedByDanger = true
+        StartHopAscend()
         return
     end
 
+    -- a manual hop leaves right away, the climb is only a safety measure for automatic hops
+    if not manual then StartHopAscend() end
     HopPhase = "waiting"
-    HopWaitUntil = tick() + HOP_DELAY
+    HopWaitUntil = tick() + (manual and 0.5 or HOP_DELAY)
 end
 task.spawn(function()
     while true do
         task.wait(0.2)
+        if HopPhase == "idle" and (ManualHop.Active or ManualHop.Override) then
+            ManualHop.Active = false
+            ManualHop.Override = false
+        end
+        if HopActive() then
+            HopActiveSince = HopActiveSince or tick()
+            if tick() - HopActiveSince > 150 and not RiskBlocksHop() then
+                HopToast("Hop got stuck, resetting")
+                HopToken += 1
+                ManualHop.Active = false
+                ManualHop.Override = false
+                HopPhase = "idle"
+                HopCooldownUntil = tick() + HOP_LANDING_GRACE
+                HopActiveSince = nil
+                ServerHopCache.List = nil
+                ServerHopCache.Fetching = false
+            end
+        else
+            HopActiveSince = nil
+        end
         if HopPhase == "waiting" then
-            if IsBountyAtRisk() then
+            if RiskBlocksHop() then
                 HopPhase = "preparing"
+                HopPrepSince = tick()
                 HopInterruptedByDanger = true
             elseif tick() >= HopWaitUntil then
                 BeginHopMatch()
             end
-        elseif HopPhase == "matching" and IsBountyAtRisk() then
+        elseif HopPhase == "matching" and RiskBlocksHop() then
             HopPhase = "preparing"
+            HopPrepSince = tick()
             HopInterruptedByDanger = true
-        elseif HopPhase == "preparing" and not IsBountyAtRisk() then
-            HopInterruptedByDanger = false
-            if CurrentTarget and not Stay.Armed then
-                HopPhase = "idle"
-            elseif Settings.AutoBounty then
-                HopPhase = "waiting"
-                HopWaitUntil = tick() + HOP_DELAY
+        elseif HopPhase == "preparing" then
+            if ManualHop.Active and not ManualHop.Override and tick() - HopPrepSince > 45 then
+                ManualHop.Override = true
+                HopToast("Combat timer did not end, hopping anyway (manual hop)")
+            end
+            if not RiskBlocksHop() then
+                HopInterruptedByDanger = false
+                if CurrentTarget and not Stay.Armed and not ManualHop.Active then
+                    HopPhase = "idle"
+                elseif Settings.AutoBounty or ManualHop.Active then
+                    HopPhase = "waiting"
+                    HopWaitUntil = tick() + (ManualHop.Active and 0.5 or HOP_DELAY)
+                else
+                    HopPhase = "idle"
+                end
             else
-                HopPhase = "idle"
+                HopToast("Hop paused: bounty at risk (combat). Waiting for it to end...")
             end
         end
     end
@@ -1993,7 +2261,7 @@ do
     local DeathBound = nil
 
     local function OnDeath()
-        if HopActive() then return end
+        if not Settings.AutoBounty or HopActive() then return end
         DeathCount += 1
         if DeathCount < DEATH_HOP_LIMIT then return end
         DeathCount = 0
@@ -2906,29 +3174,37 @@ task.spawn(function()
             TargetInvalidSince = nil
         end
 
-        if not CurrentTarget and not Stay.Armed then
+        if not CurrentTarget and not Stay.Armed and not ManualHopOn() then
             if tick() >= NextTargetSwitch then
                 NextTargetSwitch = tick() + 0.5
                 LastScanTime = tick()
                 local nearest = GetNearestTarget()
                 if nearest then
+                    NoTargetSince = nil
                     SetTarget(nearest)
+                else
+                    NoTargetSince = NoTargetSince or tick()
                 end
             end
+        elseif CurrentTarget then
+            NoTargetSince = nil
         end
 
-        if CurrentTarget and HopActive() and not Stay.Armed then
+        if CurrentTarget and HopActive() and not Stay.Armed and not ManualHopOn() then
             HopPhase = "idle"
             HopInterruptedByDanger = false
         end
 
-        if not CurrentTarget and LastScanTime >= TargetLostTime then
-            if IsBountyAtRisk() then
+        if not CurrentTarget then
+            local noTargetsLong = NoTargetSince ~= nil
+                and tick() - NoTargetSince >= (tonumber(Settings.NoTargetHopDelay) or 3)
+            if IsBountyAtRisk() and LastScanTime >= TargetLostTime then
                 HopInterruptedByDanger = true
                 if not HopActive() then
                     DoServerHop()
                 end
-            elseif not HopActive() and tick() >= HopCooldownUntil then
+            elseif noTargetsLong and not HopActive() and tick() >= HopCooldownUntil then
+                HopToast("No attackable players left (PvP off, safe zone or already killed), hopping")
                 DoServerHop()
             end
         end
@@ -2957,6 +3233,8 @@ LocalPlayer.CharacterAdded:Connect(function()
         ApplyTeam(Settings.SelectTeam)
     end
     if HopActive() then
+        ManualHop.Active = false
+        ManualHop.Override = false
         HopPhase = "idle"
         ServerHopCache.List = nil
         TargetLockStart = tick()
@@ -3490,9 +3768,12 @@ Tabs.Server:Button({
     Title = T("Manual Hop"),
     Desc = "",
     Callback = function()
+        ManualHop.Active = true
+        ManualHop.Override = false
+        HopFailStreak = 0
         HopPhase = "idle"
         ServerHopCache.List = nil
-        DoServerHop()
+        DoServerHop(true)
     end
 })
 
@@ -3509,6 +3790,17 @@ UI["MaxStaySeconds"] = Tabs.Server:Slider({
     IsTextbox = true,
     Callback = function(v)
         Settings.MaxStaySeconds = v
+    end
+})
+
+UI["NoTargetHopDelay"] = Tabs.Server:Slider({
+    Title = "Hop when no targets left (s)",
+    Desc = "Everyone has PvP off, is in a safe zone or was already killed",
+    Value = { Min = 1, Max = 30, Default = Settings.NoTargetHopDelay },
+    Step = 1,
+    IsTextbox = true,
+    Callback = function(v)
+        Settings.NoTargetHopDelay = v
     end
 })
 
@@ -3545,6 +3837,46 @@ UI["SelectTeam"] = Tabs.Bounty:Dropdown({
         end
     end
 })
+
+
+do
+    local WebhookTab = Tabs.Webhook
+    UI["WebhookEnabled"] = WebhookTab:Toggle({
+        Title = "Enable Webhook",
+        Desc = "Send bounty and hop reports to a Discord channel",
+        Value = Settings.WebhookEnabled,
+        Callback = function(v) Settings.WebhookEnabled = v == true end
+    })
+    if type(WebhookTab.Input) == "function" then
+        UI["WebhookUrl"] = WebhookTab:Input({
+            Title = "Webhook URL",
+            Desc = "https://discord.com/api/webhooks/ID/TOKEN",
+            Value = Settings.WebhookUrl,
+            Placeholder = "https://discord.com/api/webhooks/...",
+            Callback = function(v) Settings.WebhookUrl = tostring(v or ""):gsub("%s+", "") end
+        })
+    end
+    UI["WebhookOnKill"] = WebhookTab:Toggle({
+        Title = "Report bounty earned",
+        Value = Settings.WebhookOnKill,
+        Callback = function(v) Settings.WebhookOnKill = v == true end
+    })
+    UI["WebhookOnHop"] = WebhookTab:Toggle({
+        Title = "Report server hops",
+        Value = Settings.WebhookOnHop,
+        Callback = function(v) Settings.WebhookOnHop = v == true end
+    })
+    UI["WebhookHideName"] = WebhookTab:Toggle({
+        Title = "Hide my username",
+        Value = Settings.WebhookHideName,
+        Callback = function(v) Settings.WebhookHideName = v == true end
+    })
+    WebhookTab:Button({
+        Title = "Send Test Message",
+        AutoSave = false,
+        Callback = function() Webhook.Test() end
+    })
+end
 
 local HttpService = game:GetService("HttpService")
 local CONFIG_FOLDER = "AutoBountyMain"
@@ -3620,8 +3952,14 @@ local SYNC_ITEMS = {
     { "HopBountyRange", "dropdown", function() return Settings.HopBountyRange end },
     { "LockTimeBounty", "value", function() return Settings.LockTime end },
     { "MaxStaySeconds", "value", function() return Settings.MaxStaySeconds end },
+    { "NoTargetHopDelay", "value", function() return Settings.NoTargetHopDelay end },
     { "AutoLoadConfig", "toggle", function() return Settings.AutoLoadConfig end },
-    { "AutoSaveConfig", "toggle", function() return Settings.AutoSaveConfig end }
+    { "AutoSaveConfig", "toggle", function() return Settings.AutoSaveConfig end },
+    { "WebhookEnabled", "toggle", function() return Settings.WebhookEnabled end },
+    { "WebhookUrl", "input", function() return Settings.WebhookUrl end },
+    { "WebhookOnKill", "toggle", function() return Settings.WebhookOnKill end },
+    { "WebhookOnHop", "toggle", function() return Settings.WebhookOnHop end },
+    { "WebhookHideName", "toggle", function() return Settings.WebhookHideName end }
 }
 
 for weaponTip, prefix in pairs({ Melee = "Melee", Sword = "Sword", ["Blox Fruit"] = "Fruit", Gun = "Gun" }) do
@@ -3880,7 +4218,7 @@ do
     function ConfigExport.Text(data)
         local clean = {}
         for key, value in pairs(data or {}) do
-            if not IsSkippedConfigKey(key) then
+            if not IsSkippedConfigKey(key) and key ~= "WebhookUrl" then
                 clean[key] = value
             end
         end
